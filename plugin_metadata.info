@@ -1,0 +1,21 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+# Plugin code exposes this data; the host still owns trust and provenance.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-05-19
+
+[language.dax]
+language_name = DAX
+language_short_name = DAX
+monaco_language = plaintext
+default_filename = measure.dax
+language_file_extensions = .dax
+
+[language.m]
+language_name = Power Query M
+language_short_name = M
+monaco_language = plaintext
+default_filename = query.m
+language_file_extensions = .m
