@@ -22,7 +22,7 @@
 //!   .dax → "dax" unconditionally.
 //!   .m   → content-based: DAX keywords → "dax"; let/in structure → "m".
 
-use intentdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
+use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 
 wit_bindgen::generate!({
     path: "wit/plugin.wit",
@@ -37,7 +37,7 @@ use crate::exports::intentdiff::plugin::parser::ParserMode;
 const PLUGIN_METADATA: &str = include_str!("../plugin_metadata.info");
 
 fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
-    let metadata = intentdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
+    let metadata = intentumdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
     ids.into_iter()
         .map(|language_id| {
             let info = metadata.language_or_default(&language_id);
@@ -558,7 +558,7 @@ export!(DaxParser);
 mod tests {
     use super::*;
 
-    intentdiff_plugin_sdk::plugin_compliance_tests! {
+    intentumdiff_plugin_sdk::plugin_compliance_tests! {
         process: parse_dax,
         detect_fn: detect_language_impl,
         detect_cases: [
@@ -589,26 +589,26 @@ mod tests {
     #[test]
     fn test_dax_valid_json() {
         let out = parse_dax(DAX_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_valid_json(&out, "DAX_SAMPLE");
-        intentdiff_plugin_sdk::testing::assert_no_error(&out, "DAX_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_valid_json(&out, "DAX_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_no_error(&out, "DAX_SAMPLE");
     }
 
     #[test]
     fn test_dax_root_type() {
         let out = parse_dax(DAX_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_root_node_type(&out, "dax_file", "DAX_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_root_node_type(&out, "dax_file", "DAX_SAMPLE");
     }
 
     #[test]
     fn test_dax_measures_found() {
         let out = parse_dax(DAX_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "measure", "DAX_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "measure", "DAX_SAMPLE");
     }
 
     #[test]
     fn test_dax_table_definition() {
         let out = parse_dax(DAX_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(
             &out,
             "table_definition",
             "DAX_SAMPLE",
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn test_dax_evaluate() {
         let out = parse_dax(DAX_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "evaluate", "DAX_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "evaluate", "DAX_SAMPLE");
     }
 
     #[test]
@@ -626,12 +626,12 @@ mod tests {
         let out = parse_dax(
             "DEFINE\nMEASURE Sales[Sales YTD] =\n    TOTALYTD(SUM(Sales[Amount]), Dates[Date])\n\nEVALUATE\nSUMMARIZECOLUMNS(Dates[Year], \"Total\", [Sales YTD])\n",
         );
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(
             &out,
             "measure_expression",
             "DAX_SAMPLE",
         );
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(
             &out,
             "query_expression",
             "DAX_SAMPLE",
@@ -675,27 +675,27 @@ mod tests {
     #[test]
     fn test_m_valid_json() {
         let out = parse_m(M_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_valid_json(&out, "M_SAMPLE");
-        intentdiff_plugin_sdk::testing::assert_no_error(&out, "M_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_valid_json(&out, "M_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_no_error(&out, "M_SAMPLE");
     }
 
     #[test]
     fn test_m_root_type() {
         let out = parse_m(M_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_root_node_type(&out, "m_file", "M_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_root_node_type(&out, "m_file", "M_SAMPLE");
     }
 
     #[test]
     fn test_m_query_and_steps() {
         let out = parse_m(M_SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "query", "M_SAMPLE");
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "step", "M_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "query", "M_SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "step", "M_SAMPLE");
     }
 
     #[test]
     fn test_m_steps_include_expression_children() {
         let out = parse_m("let\n    Source = 1,\n    Total = Source + 2\nin\n    Total\n");
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(
             &out,
             "step_expression",
             "M expression child",
