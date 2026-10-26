@@ -62,7 +62,25 @@ struct DaxParser;
 // ---------------------------------------------------------------------------
 
 fn leaf(id: &str, node_type: &str, label: &str, line: u32) -> SemanticNode {
-    SemanticNodeBuilder::new(id, node_type, label, line, 0, line, 0, String::new()).build()
+    let mut parts = label.split('\n');
+    let first = parts.next().unwrap_or("");
+    let mut end_line = line;
+    let mut end_col = first.len() as u32;
+    for part in parts {
+        end_line += 1;
+        end_col = part.len() as u32;
+    }
+    SemanticNodeBuilder::new(
+        id,
+        node_type,
+        label,
+        line,
+        0,
+        end_line,
+        end_col,
+        String::new(),
+    )
+    .build()
 }
 
 fn block_node(
@@ -345,6 +363,9 @@ pub(crate) fn parse_dax(source: &str) -> String {
         }
 
         if let Some(definition) = active.as_mut() {
+            if definition.expression_lines.is_empty() {
+                definition.expression_start = lineno;
+            }
             definition.expression_lines.push(trimmed.to_string());
             definition.end = lineno;
         }
@@ -388,6 +409,7 @@ pub(crate) fn parse_m(source: &str) -> String {
     let mut query_counter: usize = 0;
     let mut step_children: Vec<SemanticNode> = Vec::new();
     let mut step_count: usize = 0;
+    let mut pending_query_output: Option<(String, String, u32, u32, Vec<SemanticNode>)> = None;
 
     for (idx, line) in source.lines().enumerate() {
         let lineno = idx as u32;
@@ -397,6 +419,30 @@ pub(crate) fn parse_m(source: &str) -> String {
         }
 
         let lower_trimmed = trimmed.to_lowercase();
+
+        if let Some((qid, label, query_start_line, in_line, mut query_children)) =
+            pending_query_output.take()
+        {
+            let output = strip_m_trailing_comma(trimmed);
+            if !output.is_empty() {
+                let output_id = format!("{}.{}", qid, query_children.len());
+                query_children.push(leaf(
+                    &output_id,
+                    "query_output",
+                    &output,
+                    lineno,
+                ));
+            }
+            children.push(block_node(
+                &qid,
+                "query",
+                &label,
+                query_start_line,
+                lineno.max(in_line),
+                query_children,
+            ));
+            continue;
+        }
 
         // Detect "let" keyword starting a query
         if !in_let
@@ -428,16 +474,34 @@ pub(crate) fn parse_m(source: &str) -> String {
                 counter += 1;
                 i
             });
-            let n = block_node(
-                &qid,
-                "query",
-                &label,
-                query_start,
-                lineno,
-                step_children.clone(),
-            );
-            children.push(n);
-            step_children.clear();
+            let mut query_children = std::mem::take(&mut step_children);
+            let inline_output = trimmed[2..].trim();
+            if !inline_output.is_empty() {
+                let output = strip_m_trailing_comma(inline_output);
+                let output_id = format!("{}.{}", qid, query_children.len());
+                query_children.push(leaf(
+                    &output_id,
+                    "query_output",
+                    &output,
+                    lineno,
+                ));
+                children.push(block_node(
+                    &qid,
+                    "query",
+                    &label,
+                    query_start,
+                    lineno,
+                    query_children,
+                ));
+            } else {
+                pending_query_output = Some((
+                    qid,
+                    label,
+                    query_start,
+                    lineno,
+                    query_children,
+                ));
+            }
             continue;
         }
 
@@ -466,6 +530,19 @@ pub(crate) fn parse_m(source: &str) -> String {
                 }
             }
         }
+    }
+
+    if let Some((qid, label, query_start_line, in_line, query_children)) =
+        pending_query_output.take()
+    {
+        children.push(block_node(
+            &qid,
+            "query",
+            &label,
+            query_start_line,
+            in_line,
+            query_children,
+        ));
     }
 
     // Drain unclosed let block
@@ -669,6 +746,47 @@ mod tests {
         assert_ne!(
             old_hash, new_hash,
             "changed query expression should affect evaluate hash"
+        );
+    }
+
+    #[test]
+    fn test_dax_evaluate_expression_uses_expression_source_range() {
+        let out = parse_dax("EVALUATE\nSUMMARIZECOLUMNS(Dates[Year])\n");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let expression = &value["children"][0]["children"][0];
+        assert_eq!(expression["node_type"], "query_expression");
+        assert_eq!(expression["position"]["start_line"], 1);
+        assert!(
+            expression["position"]["end_col"].as_u64().unwrap() > 0,
+            "query expression must not be zero-length"
+        );
+    }
+
+    #[test]
+    fn test_m_query_output_change_is_semantic() {
+        let old = parse_m(
+            "let\n    Source = 1,\n    FilteredRows = Source\nin\n    FilteredRows\n",
+        );
+        let new = parse_m(
+            "let\n    Source = 1,\n    FilteredRows = Source\nin\n    Source\n",
+        );
+        let old_v: serde_json::Value = serde_json::from_str(&old).unwrap();
+        let new_v: serde_json::Value = serde_json::from_str(&new).unwrap();
+        let old_query = &old_v["children"][0];
+        let new_query = &new_v["children"][0];
+
+        assert_ne!(
+            old_query["structural_hash"],
+            new_query["structural_hash"],
+            "changing the expression after IN must alter the query hash"
+        );
+        assert_eq!(
+            old_query["children"].as_array().unwrap().last().unwrap()["node_type"],
+            "query_output"
+        );
+        assert_eq!(
+            new_query["children"].as_array().unwrap().last().unwrap()["label"],
+            "Source"
         );
     }
 
