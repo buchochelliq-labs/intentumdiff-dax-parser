@@ -83,6 +83,23 @@ fn leaf(id: &str, node_type: &str, label: &str, line: u32) -> SemanticNode {
     .build()
 }
 
+/// Preserve the exact byte-column origin of an M output expression.
+fn leaf_at(id: &str, node_type: &str, label: &str, line: u32, start_col: u32) -> SemanticNode {
+    let mut end_line = line;
+    let mut end_col = start_col;
+    for (i, part) in label.split('\n').enumerate() {
+        if i > 0 {
+            end_line += 1;
+            end_col = 0;
+        }
+        end_col += part.len() as u32;
+    }
+    SemanticNodeBuilder::new(
+        id, node_type, label, line, start_col, end_line, end_col, String::new(),
+    )
+    .build()
+}
+
 fn block_node(
     id: &str,
     node_type: &str,
@@ -426,11 +443,15 @@ pub(crate) fn parse_m(source: &str) -> String {
             let output = strip_m_trailing_comma(trimmed);
             if !output.is_empty() {
                 let output_id = format!("{}.{}", qid, query_children.len());
-                query_children.push(leaf(
+                // The tree retains the trimmed label but positions are in
+                // the original, potentially indented, source line.
+                let start_col = line.find(&output).expect("M output occurs in source") as u32;
+                query_children.push(leaf_at(
                     &output_id,
                     "query_output",
                     &output,
                     lineno,
+                    start_col,
                 ));
             }
             children.push(block_node(
@@ -479,11 +500,14 @@ pub(crate) fn parse_m(source: &str) -> String {
             if !inline_output.is_empty() {
                 let output = strip_m_trailing_comma(inline_output);
                 let output_id = format!("{}.{}", qid, query_children.len());
-                query_children.push(leaf(
+                // The inline expression begins after the IN keyword.
+                let start_col = line.rfind(&output).expect("inline M output occurs in source") as u32;
+                query_children.push(leaf_at(
                     &output_id,
                     "query_output",
                     &output,
                     lineno,
+                    start_col,
                 ));
                 children.push(block_node(
                     &qid,
