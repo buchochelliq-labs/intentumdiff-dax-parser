@@ -83,7 +83,7 @@ fn leaf(id: &str, node_type: &str, label: &str, line: u32) -> SemanticNode {
     .build()
 }
 
-/// Preserve the exact byte-column origin of an M output expression.
+/// Preserve the exact byte-column origin of an M expression.
 fn leaf_at(id: &str, node_type: &str, label: &str, line: u32, start_col: u32) -> SemanticNode {
     let mut end_line = line;
     let mut end_col = start_col;
@@ -546,7 +546,19 @@ pub(crate) fn parse_m(source: &str) -> String {
                     let mut children = Vec::new();
                     if !expression.is_empty() {
                         let expression_id = format!("{}.0", step_id);
-                        children.push(leaf(&expression_id, "step_expression", &expression, lineno));
+                        // Semantic labels are trimmed, but source locations must refer to
+                        // the original UTF-8 bytes, including indentation and the step name.
+                        let rhs = &trimmed[eq_pos + 1..];
+                        let rhs_leading_space = rhs.len() - rhs.trim_start().len();
+                        let start_col = line.find(trimmed).expect("M step occurs in source")
+                            + eq_pos + 1 + rhs_leading_space;
+                        children.push(leaf_at(
+                            &expression_id,
+                            "step_expression",
+                            &expression,
+                            lineno,
+                            start_col as u32,
+                        ));
                     }
                     step_children.push(block_node(
                         &step_id, "step", &name, lineno, lineno, children,
@@ -894,6 +906,48 @@ mod tests {
             old_hash, new_hash,
             "changed step expression should affect step hash"
         );
+    }
+
+    #[test]
+    fn test_m_step_expression_exact_edited_numeric_source_spans() {
+        // This is the source-judged 74-language corpus mutation which used to
+        // report the edit at column 62 outside a fabricated 0..45 leaf span.
+        for (number, expected_end) in [("0", 64_u64), ("100", 66_u64)] {
+            let source = format!(
+                "let\n    Source = Sql.Database(\"server\", \"sales\"),\n    FilteredRows = Table.SelectRows(Source, each [Amount] > {number})\nin\n    FilteredRows\n"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&parse_m(&source)).unwrap();
+            let leaf = &parsed["children"][0]["children"][1]["children"][0];
+            assert_eq!(leaf["node_type"], "step_expression");
+            assert_eq!(leaf["position"]["start_line"], 2);
+            assert_eq!(leaf["position"]["end_line"], 2);
+            assert_eq!(leaf["position"]["start_col"], 19);
+            assert_eq!(leaf["position"]["end_col"], expected_end);
+
+            let source_line = source.lines().nth(2).unwrap();
+            let numeric_start = source_line.rfind(number).unwrap() as u64;
+            assert_eq!(numeric_start, 62);
+            let start = leaf["position"]["start_col"].as_u64().unwrap();
+            let end = leaf["position"]["end_col"].as_u64().unwrap();
+            assert!(start <= numeric_start && numeric_start + number.len() as u64 <= end);
+        }
+    }
+
+    #[test]
+    fn test_m_step_expression_byte_span_accounts_for_unicode_and_rhs_whitespace() {
+        let source = "let\n  #\"Café\" = \t Table.SelectRows(Source, each [Amount] > 1),\nin\n  #\"Café\"\n";
+        let parsed: serde_json::Value = serde_json::from_str(&parse_m(source)).unwrap();
+        let leaf = &parsed["children"][0]["children"][0]["children"][0];
+        let line = source.lines().nth(1).unwrap();
+        let expression = "Table.SelectRows(Source, each [Amount] > 1)";
+        let start = line.find(expression).unwrap() as u64;
+        assert!(line[..start as usize].contains('é'));
+        assert_eq!(leaf["node_type"], "step_expression");
+        assert_eq!(leaf["label"], expression);
+        assert_eq!(leaf["position"]["start_col"], start);
+        assert_eq!(leaf["position"]["end_col"], start + expression.len() as u64);
+        assert_eq!(leaf["position"]["start_line"], 1);
+        assert_eq!(leaf["position"]["end_line"], 1);
     }
 
     #[test]
