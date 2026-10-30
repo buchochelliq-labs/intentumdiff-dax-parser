@@ -815,6 +815,39 @@ mod tests {
     }
 
     #[test]
+    fn test_m_query_output_exact_source_byte_span() {
+        for (output, expected_end_col) in [("FilteredRows", 16_u64), ("Source", 10_u64)] {
+            let source = format!(
+                "let\n    Source = 1,\n    FilteredRows = Source\nin\n    {output}\n"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&parse_m(&source)).unwrap();
+            let node = parsed["children"][0]["children"]
+                .as_array().unwrap().last().unwrap();
+            assert_eq!(node["node_type"], "query_output");
+            assert_eq!(node["label"], output);
+            assert_eq!(node["position"]["start_line"], 4);
+            assert_eq!(node["position"]["end_line"], 4);
+            assert_eq!(node["position"]["start_col"], 4);
+            assert_eq!(node["position"]["end_col"], expected_end_col);
+        }
+    }
+
+    #[test]
+    fn test_m_inline_query_output_exact_source_byte_span() {
+        let parsed: serde_json::Value = serde_json::from_str(&parse_m(
+            "let\n    Source = 1\n  in Source\n",
+        )).unwrap();
+        let node = parsed["children"][0]["children"]
+            .as_array().unwrap().last().unwrap();
+        assert_eq!(node["node_type"], "query_output");
+        assert_eq!(node["label"], "Source");
+        assert_eq!(node["position"]["start_line"], 2);
+        assert_eq!(node["position"]["end_line"], 2);
+        assert_eq!(node["position"]["start_col"], 5);
+        assert_eq!(node["position"]["end_col"], 11);
+    }
+
+    #[test]
     fn test_m_valid_json() {
         let out = parse_m(M_SAMPLE);
         intentumdiff_plugin_sdk::testing::assert_valid_json(&out, "M_SAMPLE");
