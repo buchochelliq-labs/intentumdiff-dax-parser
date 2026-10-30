@@ -912,7 +912,7 @@ mod tests {
     fn test_m_step_expression_exact_edited_numeric_source_spans() {
         // This is the source-judged 74-language corpus mutation which used to
         // report the edit at column 62 outside a fabricated 0..45 leaf span.
-        for (number, expected_end) in [("0", 64_u64), ("100", 66_u64)] {
+        for number in ["100", "101"] {
             let source = format!(
                 "let\n    Source = Sql.Database(\"server\", \"sales\"),\n    FilteredRows = Table.SelectRows(Source, each [Amount] > {number})\nin\n    FilteredRows\n"
             );
@@ -922,14 +922,16 @@ mod tests {
             assert_eq!(leaf["position"]["start_line"], 2);
             assert_eq!(leaf["position"]["end_line"], 2);
             assert_eq!(leaf["position"]["start_col"], 19);
-            assert_eq!(leaf["position"]["end_col"], expected_end);
+            assert_eq!(leaf["position"]["end_col"], 64);
 
             let source_line = source.lines().nth(2).unwrap();
             let numeric_start = source_line.rfind(number).unwrap() as u64;
-            assert_eq!(numeric_start, 62);
+            assert_eq!(numeric_start, 60);
+            // The corpus changes the last byte of 100 -> 101 at column 62.
+            assert_eq!(source_line.as_bytes()[62], number.as_bytes()[2]);
             let start = leaf["position"]["start_col"].as_u64().unwrap();
             let end = leaf["position"]["end_col"].as_u64().unwrap();
-            assert!(start <= numeric_start && numeric_start + number.len() as u64 <= end);
+            assert!(start <= 62 && 63 <= end);
         }
     }
 
