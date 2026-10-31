@@ -1004,4 +1004,39 @@ mod tests {
             label
         );
     }
+
+    #[test]
+    fn dax_measure_and_expression_use_actual_utf8_source_byte_extents() {
+        let line = "  MEASURE Sales[Order Count] = COUNTROWS(Sales)";
+        let source = format!("DEFINE\n{line}\n");
+        let tree: serde_json::Value = serde_json::from_str(&parse_dax(&source)).unwrap();
+        let measure = &tree["children"][0];
+        assert_eq!(measure["node_type"], "measure");
+        assert_eq!(measure["label"], "Sales[Order Count]");
+        assert_eq!(measure["position"]["start_line"].as_u64(), Some(1));
+        assert_eq!(measure["position"]["start_col"].as_u64(), Some(2));
+        assert_eq!(measure["position"]["end_line"].as_u64(), Some(1));
+        assert_eq!(measure["position"]["end_col"].as_u64(), Some(line.len() as u64));
+        let expression = &measure["children"][0];
+        assert_eq!(expression["node_type"], "measure_expression");
+        assert_eq!(expression["label"], "COUNTROWS(Sales)");
+        assert_eq!(expression["position"]["start_col"].as_u64(),
+                   Some(line.find("COUNTROWS(Sales)").unwrap() as u64));
+        assert_eq!(expression["position"]["end_col"].as_u64(), Some(line.len() as u64));
+    }
+
+    #[test]
+    fn m_step_name_has_nonempty_original_source_extent() {
+        let source = "let\n    UnusedPreview = Source,\nin\n    UnusedPreview\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_m(source)).unwrap();
+        let step = &tree["children"][0]["children"][0];
+        assert_eq!(step["node_type"], "step");
+        assert_eq!(step["label"], "UnusedPreview");
+        assert_eq!(step["position"]["start_line"].as_u64(), Some(1));
+        assert_eq!(step["position"]["end_line"].as_u64(), Some(1));
+        assert_eq!(step["position"]["start_col"].as_u64(), Some(4));
+        assert_eq!(step["position"]["end_col"].as_u64(),
+                   Some(4 + "UnusedPreview".len() as u64));
+    }
+
 }
