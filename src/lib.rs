@@ -323,28 +323,51 @@ fn push_dax_definition(
     children: &mut Vec<SemanticNode>,
     counter: &mut usize,
     definition: DaxDefinition,
+    source: &str,
 ) {
     let id = format!("0.{}", counter);
     *counter += 1;
+    let lines: Vec<&str> = source.lines().collect();
+    let declaration_line = lines[definition.start as usize];
+    let opening_start = declaration_line.len() - declaration_line.trim_start().len();
     let expression = definition.expression_lines.join("\n").trim().to_string();
     let expression_children = if expression.is_empty() {
         vec![]
     } else {
-        vec![leaf(
+        // The semantic label is trimmed, but its Rust SourceSpan must start at
+        // the real expression bytes, not at the declaration keyword (#9).
+        let expression_line = lines[definition.expression_start as usize];
+        let first_expression = expression.split('\n').next().unwrap_or("");
+        let expression_col = expression_line.find(first_expression)
+            .expect("DAX expression starts in original source");
+        let mut expression_node = leaf_at(
             &format!("{}.0", id),
             definition.expression_type,
             &expression,
             definition.expression_start,
-        )]
+            expression_col as u32,
+        );
+        let last_line_idx = definition.expression_start as usize
+            + expression.split('\n').count() - 1;
+        expression_node.position.end_col =
+            lines[last_line_idx].trim_end().len() as u32;
+        vec![expression_node]
     };
-    children.push(block_node(
+    let mut declaration = block_node(
         &id,
         definition.node_type,
         &definition.label,
         definition.start,
         definition.end,
         expression_children,
-    ));
+    );
+    declaration.position.start_col = opening_start as u32;
+    if definition.start == definition.end {
+        // An inline measure previously had (row,0)-(row,0) and therefore no
+        // independent source-byte evidence, despite its semantic label.
+        declaration.position.end_col = declaration_line.trim_end().len() as u32;
+    }
+    children.push(declaration);
 }
 
 pub(crate) fn parse_dax(source: &str) -> String {
@@ -373,7 +396,7 @@ pub(crate) fn parse_dax(source: &str) -> String {
 
         if let Some(definition) = start_dax_definition(trimmed, &upper, lineno, &mut eval_counter) {
             if let Some(previous) = active.take() {
-                push_dax_definition(&mut children, &mut counter, previous);
+                push_dax_definition(&mut children, &mut counter, previous, source);
             }
             active = Some(definition);
             continue;
@@ -389,7 +412,7 @@ pub(crate) fn parse_dax(source: &str) -> String {
     }
 
     if let Some(definition) = active.take() {
-        push_dax_definition(&mut children, &mut counter, definition);
+        push_dax_definition(&mut children, &mut counter, definition, source);
     }
 
     let root = SemanticNodeBuilder::new(
@@ -560,9 +583,16 @@ pub(crate) fn parse_m(source: &str) -> String {
                             start_col as u32,
                         ));
                     }
-                    step_children.push(block_node(
+                    let mut step = block_node(
                         &step_id, "step", &name, lineno, lineno, children,
-                    ));
+                    );
+                    // A labelled M step must represent its source name bytes,
+                    // not the vacuous (row,0)-(row,0) block extent (#10).
+                    let name_col = line.find(name.as_str())
+                        .expect("M step name occurs in original source") as u32;
+                    step.position.start_col = name_col;
+                    step.position.end_col = name_col + name.len() as u32;
+                    step_children.push(step);
                 }
             }
         }
