@@ -83,6 +83,23 @@ fn leaf(id: &str, node_type: &str, label: &str, line: u32) -> SemanticNode {
     .build()
 }
 
+/// Preserve the exact byte-column origin of an M expression.
+fn leaf_at(id: &str, node_type: &str, label: &str, line: u32, start_col: u32) -> SemanticNode {
+    let mut end_line = line;
+    let mut end_col = start_col;
+    for (i, part) in label.split('\n').enumerate() {
+        if i > 0 {
+            end_line += 1;
+            end_col = 0;
+        }
+        end_col += part.len() as u32;
+    }
+    SemanticNodeBuilder::new(
+        id, node_type, label, line, start_col, end_line, end_col, String::new(),
+    )
+    .build()
+}
+
 fn block_node(
     id: &str,
     node_type: &str,
@@ -306,28 +323,51 @@ fn push_dax_definition(
     children: &mut Vec<SemanticNode>,
     counter: &mut usize,
     definition: DaxDefinition,
+    source: &str,
 ) {
     let id = format!("0.{}", counter);
     *counter += 1;
+    let lines: Vec<&str> = source.lines().collect();
+    let declaration_line = lines[definition.start as usize];
+    let opening_start = declaration_line.len() - declaration_line.trim_start().len();
     let expression = definition.expression_lines.join("\n").trim().to_string();
     let expression_children = if expression.is_empty() {
         vec![]
     } else {
-        vec![leaf(
+        // The semantic label is trimmed, but its Rust SourceSpan must start at
+        // the real expression bytes, not at the declaration keyword (#9).
+        let expression_line = lines[definition.expression_start as usize];
+        let first_expression = expression.split('\n').next().unwrap_or("");
+        let expression_col = expression_line.find(first_expression)
+            .expect("DAX expression starts in original source");
+        let mut expression_node = leaf_at(
             &format!("{}.0", id),
             definition.expression_type,
             &expression,
             definition.expression_start,
-        )]
+            expression_col as u32,
+        );
+        let last_line_idx = definition.expression_start as usize
+            + expression.split('\n').count() - 1;
+        expression_node.position.end_col =
+            lines[last_line_idx].trim_end().len() as u32;
+        vec![expression_node]
     };
-    children.push(block_node(
+    let mut declaration = block_node(
         &id,
         definition.node_type,
         &definition.label,
         definition.start,
         definition.end,
         expression_children,
-    ));
+    );
+    declaration.position.start_col = opening_start as u32;
+    if definition.start == definition.end {
+        // An inline measure previously had (row,0)-(row,0) and therefore no
+        // independent source-byte evidence, despite its semantic label.
+        declaration.position.end_col = declaration_line.trim_end().len() as u32;
+    }
+    children.push(declaration);
 }
 
 pub(crate) fn parse_dax(source: &str) -> String {
@@ -356,7 +396,7 @@ pub(crate) fn parse_dax(source: &str) -> String {
 
         if let Some(definition) = start_dax_definition(trimmed, &upper, lineno, &mut eval_counter) {
             if let Some(previous) = active.take() {
-                push_dax_definition(&mut children, &mut counter, previous);
+                push_dax_definition(&mut children, &mut counter, previous, source);
             }
             active = Some(definition);
             continue;
@@ -372,7 +412,7 @@ pub(crate) fn parse_dax(source: &str) -> String {
     }
 
     if let Some(definition) = active.take() {
-        push_dax_definition(&mut children, &mut counter, definition);
+        push_dax_definition(&mut children, &mut counter, definition, source);
     }
 
     let root = SemanticNodeBuilder::new(
@@ -426,11 +466,15 @@ pub(crate) fn parse_m(source: &str) -> String {
             let output = strip_m_trailing_comma(trimmed);
             if !output.is_empty() {
                 let output_id = format!("{}.{}", qid, query_children.len());
-                query_children.push(leaf(
+                // The tree retains the trimmed label but positions are in
+                // the original, potentially indented, source line.
+                let start_col = line.find(&output).expect("M output occurs in source") as u32;
+                query_children.push(leaf_at(
                     &output_id,
                     "query_output",
                     &output,
                     lineno,
+                    start_col,
                 ));
             }
             children.push(block_node(
@@ -479,11 +523,14 @@ pub(crate) fn parse_m(source: &str) -> String {
             if !inline_output.is_empty() {
                 let output = strip_m_trailing_comma(inline_output);
                 let output_id = format!("{}.{}", qid, query_children.len());
-                query_children.push(leaf(
+                // The inline expression begins after the IN keyword.
+                let start_col = line.rfind(&output).expect("inline M output occurs in source") as u32;
+                query_children.push(leaf_at(
                     &output_id,
                     "query_output",
                     &output,
                     lineno,
+                    start_col,
                 ));
                 children.push(block_node(
                     &qid,
@@ -522,11 +569,30 @@ pub(crate) fn parse_m(source: &str) -> String {
                     let mut children = Vec::new();
                     if !expression.is_empty() {
                         let expression_id = format!("{}.0", step_id);
-                        children.push(leaf(&expression_id, "step_expression", &expression, lineno));
+                        // Semantic labels are trimmed, but source locations must refer to
+                        // the original UTF-8 bytes, including indentation and the step name.
+                        let rhs = &trimmed[eq_pos + 1..];
+                        let rhs_leading_space = rhs.len() - rhs.trim_start().len();
+                        let start_col = line.find(trimmed).expect("M step occurs in source")
+                            + eq_pos + 1 + rhs_leading_space;
+                        children.push(leaf_at(
+                            &expression_id,
+                            "step_expression",
+                            &expression,
+                            lineno,
+                            start_col as u32,
+                        ));
                     }
-                    step_children.push(block_node(
+                    let mut step = block_node(
                         &step_id, "step", &name, lineno, lineno, children,
-                    ));
+                    );
+                    // A labelled M step must represent its source name bytes,
+                    // not the vacuous (row,0)-(row,0) block extent (#10).
+                    let name_col = line.find(name.as_str())
+                        .expect("M step name occurs in original source") as u32;
+                    step.position.start_col = name_col;
+                    step.position.end_col = name_col + name.len() as u32;
+                    step_children.push(step);
                 }
             }
         }
@@ -791,6 +857,39 @@ mod tests {
     }
 
     #[test]
+    fn test_m_query_output_exact_source_byte_span() {
+        for (output, expected_end_col) in [("FilteredRows", 16_u64), ("Source", 10_u64)] {
+            let source = format!(
+                "let\n    Source = 1,\n    FilteredRows = Source\nin\n    {output}\n"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&parse_m(&source)).unwrap();
+            let node = parsed["children"][0]["children"]
+                .as_array().unwrap().last().unwrap();
+            assert_eq!(node["node_type"], "query_output");
+            assert_eq!(node["label"], output);
+            assert_eq!(node["position"]["start_line"], 4);
+            assert_eq!(node["position"]["end_line"], 4);
+            assert_eq!(node["position"]["start_col"], 4);
+            assert_eq!(node["position"]["end_col"], expected_end_col);
+        }
+    }
+
+    #[test]
+    fn test_m_inline_query_output_exact_source_byte_span() {
+        let parsed: serde_json::Value = serde_json::from_str(&parse_m(
+            "let\n    Source = 1\n  in Source\n",
+        )).unwrap();
+        let node = parsed["children"][0]["children"]
+            .as_array().unwrap().last().unwrap();
+        assert_eq!(node["node_type"], "query_output");
+        assert_eq!(node["label"], "Source");
+        assert_eq!(node["position"]["start_line"], 2);
+        assert_eq!(node["position"]["end_line"], 2);
+        assert_eq!(node["position"]["start_col"], 5);
+        assert_eq!(node["position"]["end_col"], 11);
+    }
+
+    #[test]
     fn test_m_valid_json() {
         let out = parse_m(M_SAMPLE);
         intentumdiff_plugin_sdk::testing::assert_valid_json(&out, "M_SAMPLE");
@@ -840,6 +939,50 @@ mod tests {
     }
 
     #[test]
+    fn test_m_step_expression_exact_edited_numeric_source_spans() {
+        // This is the source-judged 74-language corpus mutation which used to
+        // report the edit at column 62 outside a fabricated 0..45 leaf span.
+        for number in ["100", "101"] {
+            let source = format!(
+                "let\n    Source = Sql.Database(\"server\", \"sales\"),\n    FilteredRows = Table.SelectRows(Source, each [Amount] > {number})\nin\n    FilteredRows\n"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&parse_m(&source)).unwrap();
+            let leaf = &parsed["children"][0]["children"][1]["children"][0];
+            assert_eq!(leaf["node_type"], "step_expression");
+            assert_eq!(leaf["position"]["start_line"], 2);
+            assert_eq!(leaf["position"]["end_line"], 2);
+            assert_eq!(leaf["position"]["start_col"], 19);
+            assert_eq!(leaf["position"]["end_col"], 64);
+
+            let source_line = source.lines().nth(2).unwrap();
+            let numeric_start = source_line.rfind(number).unwrap() as u64;
+            assert_eq!(numeric_start, 60);
+            // The corpus changes the last byte of 100 -> 101 at column 62.
+            assert_eq!(source_line.as_bytes()[62], number.as_bytes()[2]);
+            let start = leaf["position"]["start_col"].as_u64().unwrap();
+            let end = leaf["position"]["end_col"].as_u64().unwrap();
+            assert!(start <= 62 && 63 <= end);
+        }
+    }
+
+    #[test]
+    fn test_m_step_expression_byte_span_accounts_for_unicode_and_rhs_whitespace() {
+        let source = "let\n  #\"Café\" = \t Table.SelectRows(Source, each [Amount] > 1),\nin\n  #\"Café\"\n";
+        let parsed: serde_json::Value = serde_json::from_str(&parse_m(source)).unwrap();
+        let leaf = &parsed["children"][0]["children"][0]["children"][0];
+        let line = source.lines().nth(1).unwrap();
+        let expression = "Table.SelectRows(Source, each [Amount] > 1)";
+        let start = line.find(expression).unwrap() as u64;
+        assert!(line[..start as usize].contains('é'));
+        assert_eq!(leaf["node_type"], "step_expression");
+        assert_eq!(leaf["label"], expression);
+        assert_eq!(leaf["position"]["start_col"], start);
+        assert_eq!(leaf["position"]["end_col"], start + expression.len() as u64);
+        assert_eq!(leaf["position"]["start_line"], 1);
+        assert_eq!(leaf["position"]["end_line"], 1);
+    }
+
+    #[test]
     fn test_m_playground_example_is_power_query() {
         let example = <DaxParser as Guest>::example("m".to_string());
         assert!(example.old.contains("let"));
@@ -861,4 +1004,39 @@ mod tests {
             label
         );
     }
+
+    #[test]
+    fn dax_measure_and_expression_use_actual_utf8_source_byte_extents() {
+        let line = "  MEASURE Sales[Order Count] = COUNTROWS(Sales)";
+        let source = format!("DEFINE\n{line}\n");
+        let tree: serde_json::Value = serde_json::from_str(&parse_dax(&source)).unwrap();
+        let measure = &tree["children"][0];
+        assert_eq!(measure["node_type"], "measure");
+        assert_eq!(measure["label"], "Sales[Order Count]");
+        assert_eq!(measure["position"]["start_line"].as_u64(), Some(1));
+        assert_eq!(measure["position"]["start_col"].as_u64(), Some(2));
+        assert_eq!(measure["position"]["end_line"].as_u64(), Some(1));
+        assert_eq!(measure["position"]["end_col"].as_u64(), Some(line.len() as u64));
+        let expression = &measure["children"][0];
+        assert_eq!(expression["node_type"], "measure_expression");
+        assert_eq!(expression["label"], "COUNTROWS(Sales)");
+        assert_eq!(expression["position"]["start_col"].as_u64(),
+                   Some(line.find("COUNTROWS(Sales)").unwrap() as u64));
+        assert_eq!(expression["position"]["end_col"].as_u64(), Some(line.len() as u64));
+    }
+
+    #[test]
+    fn m_step_name_has_nonempty_original_source_extent() {
+        let source = "let\n    UnusedPreview = Source,\nin\n    UnusedPreview\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_m(source)).unwrap();
+        let step = &tree["children"][0]["children"][0];
+        assert_eq!(step["node_type"], "step");
+        assert_eq!(step["label"], "UnusedPreview");
+        assert_eq!(step["position"]["start_line"].as_u64(), Some(1));
+        assert_eq!(step["position"]["end_line"].as_u64(), Some(1));
+        assert_eq!(step["position"]["start_col"].as_u64(), Some(4));
+        assert_eq!(step["position"]["end_col"].as_u64(),
+                   Some(4 + "UnusedPreview".len() as u64));
+    }
+
 }
