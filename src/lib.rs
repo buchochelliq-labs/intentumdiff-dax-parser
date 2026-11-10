@@ -2,7 +2,8 @@
 //!
 //! Handles `.dax` files (DAX — Data Analysis Expressions for Power BI / SSAS)
 //! and `.m` files (Power Query M language).  No tree-sitter grammar exists for
-//! either language; this plugin uses case-insensitive line scanning.
+//! either language; DAX uses case-insensitive line scanning and M a small
+//! tokenizer with bracket/let-depth tracking.
 //!
 //! DAX semantic nodes:
 //!   dax_file          — root
@@ -12,15 +13,14 @@
 //!   var_definition    — DEFINE VAR <name> = …
 //!   evaluate          — EVALUATE block (label = query_N)
 //!
-//! Power Query M semantic nodes:
-//!   m_file            — root
-//!   query             — let … in block (label = query_N)
-//!   step              — named step inside a let block (label = step name)
-//!   step_expression   — right-hand side of a step
+//! Power Query M semantic nodes: see `m.rs` (token-based parser covering
+//! inline, multi-line and section-document forms).
 //!
 //! Detection:
 //!   .dax → "dax" unconditionally.
 //!   .m   → content-based: DAX keywords → "dax"; let/in structure → "m".
+
+mod m;
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 
@@ -61,28 +61,6 @@ struct DaxParser;
 // Node helpers
 // ---------------------------------------------------------------------------
 
-fn leaf(id: &str, node_type: &str, label: &str, line: u32) -> SemanticNode {
-    let mut parts = label.split('\n');
-    let first = parts.next().unwrap_or("");
-    let mut end_line = line;
-    let mut end_col = first.len() as u32;
-    for part in parts {
-        end_line += 1;
-        end_col = part.len() as u32;
-    }
-    SemanticNodeBuilder::new(
-        id,
-        node_type,
-        label,
-        line,
-        0,
-        end_line,
-        end_col,
-        String::new(),
-    )
-    .build()
-}
-
 /// Preserve the exact byte-column origin of an M expression.
 fn leaf_at(id: &str, node_type: &str, label: &str, line: u32, start_col: u32) -> SemanticNode {
     let mut end_line = line;
@@ -113,10 +91,6 @@ fn block_node(
         .build()
 }
 
-fn strip_m_trailing_comma(value: &str) -> String {
-    value.trim().trim_end_matches(',').trim().to_string()
-}
-
 // ---------------------------------------------------------------------------
 // DAX name extraction
 // ---------------------------------------------------------------------------
@@ -145,6 +119,25 @@ fn extract_bracket_name(rest: &str) -> String {
 // Language detection
 // ---------------------------------------------------------------------------
 
+/// First word of `content` after whitespace and `//` / `/* */` comments.
+fn m_leading_word(content: &str) -> &str {
+    let mut rest = content;
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("//") {
+            rest = r.find('\n').map_or("", |i| &r[i..]);
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.find("*/").map_or("", |i| &r[i + 2..]);
+        } else {
+            break;
+        }
+    }
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 pub(crate) fn detect_language_impl(filename: &str, content: &str) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".dax") {
@@ -162,7 +155,8 @@ pub(crate) fn detect_language_impl(filename: &str, content: &str) -> String {
         }
         // M (Power Query): let…in structure
         let cl = content.to_lowercase();
-        if cl.contains("\nlet\n")
+        let lead = m_leading_word(content);
+        if lead == "let" || lead == "section" || cl.contains("\nlet\n")
             || cl.contains("\nlet\r\n")
             || cl.contains("\r\nlet\r\n")
             || cl.starts_with("let\n")
@@ -338,8 +332,9 @@ fn push_dax_definition(
         // the real expression bytes, not at the declaration keyword (#9).
         let expression_line = lines[definition.expression_start as usize];
         let first_expression = expression.split('\n').next().unwrap_or("");
-        let expression_col = expression_line.find(first_expression)
-            .expect("DAX expression starts in original source");
+        let expression_col = expression_line.find(first_expression).unwrap_or(
+            expression_line.len() - expression_line.trim_start().len(),
+        );
         let mut expression_node = leaf_at(
             &format!("{}.0", id),
             definition.expression_type,
@@ -347,10 +342,11 @@ fn push_dax_definition(
             definition.expression_start,
             expression_col as u32,
         );
-        let last_line_idx = definition.expression_start as usize
-            + expression.split('\n').count() - 1;
+        // Blank and comment lines are skipped, so the label's line count does
+        // not locate the last expression byte; the definition end line does.
+        expression_node.position.end_line = definition.end;
         expression_node.position.end_col =
-            lines[last_line_idx].trim_end().len() as u32;
+            lines[definition.end as usize].trim_end().len() as u32;
         vec![expression_node]
     };
     let mut declaration = block_node(
@@ -362,11 +358,10 @@ fn push_dax_definition(
         expression_children,
     );
     declaration.position.start_col = opening_start as u32;
-    if definition.start == definition.end {
-        // An inline measure previously had (row,0)-(row,0) and therefore no
-        // independent source-byte evidence, despite its semantic label.
-        declaration.position.end_col = declaration_line.trim_end().len() as u32;
-    }
+    // A declaration covers its keyword line through the last expression byte,
+    // so the expression child lies inside it (inline measures previously had
+    // a vacuous (row,0)-(row,0) extent, #9; multi-line ones ended at col 0).
+    declaration.position.end_col = lines[definition.end as usize].trim_end().len() as u32;
     children.push(declaration);
 }
 
@@ -415,7 +410,7 @@ pub(crate) fn parse_dax(source: &str) -> String {
         push_dax_definition(&mut children, &mut counter, definition, source);
     }
 
-    let root = SemanticNodeBuilder::new(
+    let mut root = SemanticNodeBuilder::new(
         "0",
         "dax_file",
         "dax_file",
@@ -427,6 +422,10 @@ pub(crate) fn parse_dax(source: &str) -> String {
     )
     .children(children)
     .build();
+    // The root spans the whole document, ending after its last byte.
+    let content = source.trim_end();
+    root.position.end_line = content.matches('\n').count() as u32;
+    root.position.end_col = (content.len() - content.rfind('\n').map_or(0, |i| i + 1)) as u32;
 
     match serde_json::to_string(&root) {
         Ok(s) => s,
@@ -434,212 +433,8 @@ pub(crate) fn parse_dax(source: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Power Query M parser
-// ---------------------------------------------------------------------------
-
-pub(crate) fn parse_m(source: &str) -> String {
-    let mut children: Vec<SemanticNode> = Vec::new();
-    let mut counter: usize = 0;
-    let total_lines = source.lines().count().saturating_sub(1) as u32;
-
-    let mut in_let = false;
-    let mut query_id: Option<String> = None;
-    let mut query_start: u32 = 0;
-    let mut query_counter: usize = 0;
-    let mut step_children: Vec<SemanticNode> = Vec::new();
-    let mut step_count: usize = 0;
-    let mut pending_query_output: Option<(String, String, u32, u32, Vec<SemanticNode>)> = None;
-
-    for (idx, line) in source.lines().enumerate() {
-        let lineno = idx as u32;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let lower_trimmed = trimmed.to_lowercase();
-
-        if let Some((qid, label, query_start_line, in_line, mut query_children)) =
-            pending_query_output.take()
-        {
-            let output = strip_m_trailing_comma(trimmed);
-            if !output.is_empty() {
-                let output_id = format!("{}.{}", qid, query_children.len());
-                // The tree retains the trimmed label but positions are in
-                // the original, potentially indented, source line.
-                let start_col = line.find(&output).expect("M output occurs in source") as u32;
-                query_children.push(leaf_at(
-                    &output_id,
-                    "query_output",
-                    &output,
-                    lineno,
-                    start_col,
-                ));
-            }
-            children.push(block_node(
-                &qid,
-                "query",
-                &label,
-                query_start_line,
-                lineno.max(in_line),
-                query_children,
-            ));
-            continue;
-        }
-
-        // Detect "let" keyword starting a query
-        if !in_let
-            && (lower_trimmed == "let"
-                || lower_trimmed.starts_with("let ")
-                || lower_trimmed.starts_with("let\t"))
-        {
-            in_let = true;
-            query_start = lineno;
-            step_children.clear();
-            step_count = 0;
-            let qid = format!("0.{}", counter);
-            counter += 1;
-            query_id = Some(qid);
-            continue;
-        }
-
-        // Detect "in" keyword closing a query
-        if in_let
-            && (lower_trimmed == "in"
-                || lower_trimmed.starts_with("in ")
-                || lower_trimmed.starts_with("in\t"))
-        {
-            in_let = false;
-            let label = format!("query_{}", query_counter);
-            query_counter += 1;
-            let qid = query_id.take().unwrap_or_else(|| {
-                let i = format!("0.{}", counter);
-                counter += 1;
-                i
-            });
-            let mut query_children = std::mem::take(&mut step_children);
-            let inline_output = trimmed[2..].trim();
-            if !inline_output.is_empty() {
-                let output = strip_m_trailing_comma(inline_output);
-                let output_id = format!("{}.{}", qid, query_children.len());
-                // The inline expression begins after the IN keyword.
-                let start_col = line.rfind(&output).expect("inline M output occurs in source") as u32;
-                query_children.push(leaf_at(
-                    &output_id,
-                    "query_output",
-                    &output,
-                    lineno,
-                    start_col,
-                ));
-                children.push(block_node(
-                    &qid,
-                    "query",
-                    &label,
-                    query_start,
-                    lineno,
-                    query_children,
-                ));
-            } else {
-                pending_query_output = Some((
-                    qid,
-                    label,
-                    query_start,
-                    lineno,
-                    query_children,
-                ));
-            }
-            continue;
-        }
-
-        // Collect steps inside let block
-        if in_let {
-            if let Some(eq_pos) = trimmed.find('=') {
-                // Strip trailing comma from name; handle #"quoted names"
-                let raw_name = trimmed[..eq_pos].trim();
-                let name = raw_name
-                    .trim_start_matches('#')
-                    .trim_matches('"')
-                    .to_string();
-                if !name.is_empty() {
-                    let qid_ref = query_id.as_deref().unwrap_or("0");
-                    let step_id = format!("{}.{}", qid_ref, step_count);
-                    step_count += 1;
-                    let expression = strip_m_trailing_comma(&trimmed[eq_pos + 1..]);
-                    let mut children = Vec::new();
-                    if !expression.is_empty() {
-                        let expression_id = format!("{}.0", step_id);
-                        // Semantic labels are trimmed, but source locations must refer to
-                        // the original UTF-8 bytes, including indentation and the step name.
-                        let rhs = &trimmed[eq_pos + 1..];
-                        let rhs_leading_space = rhs.len() - rhs.trim_start().len();
-                        let start_col = line.find(trimmed).expect("M step occurs in source")
-                            + eq_pos + 1 + rhs_leading_space;
-                        children.push(leaf_at(
-                            &expression_id,
-                            "step_expression",
-                            &expression,
-                            lineno,
-                            start_col as u32,
-                        ));
-                    }
-                    let mut step = block_node(
-                        &step_id, "step", &name, lineno, lineno, children,
-                    );
-                    // A labelled M step must represent its source name bytes,
-                    // not the vacuous (row,0)-(row,0) block extent (#10).
-                    let name_col = line.find(name.as_str())
-                        .expect("M step name occurs in original source") as u32;
-                    step.position.start_col = name_col;
-                    step.position.end_col = name_col + name.len() as u32;
-                    step_children.push(step);
-                }
-            }
-        }
-    }
-
-    if let Some((qid, label, query_start_line, in_line, query_children)) =
-        pending_query_output.take()
-    {
-        children.push(block_node(
-            &qid,
-            "query",
-            &label,
-            query_start_line,
-            in_line,
-            query_children,
-        ));
-    }
-
-    // Drain unclosed let block
-    if in_let {
-        let label = format!("query_{}", query_counter);
-        let qid = query_id.take().unwrap_or_else(|| {
-            let i = format!("0.{}", counter);
-            counter += 1;
-            i
-        });
-        let n = block_node(
-            &qid,
-            "query",
-            &label,
-            query_start,
-            total_lines,
-            step_children,
-        );
-        children.push(n);
-    }
-
-    let root =
-        SemanticNodeBuilder::new("0", "m_file", "m_file", 0, 0, total_lines, 0, String::new())
-            .children(children)
-            .build();
-
-    match serde_json::to_string(&root) {
-        Ok(s) => s,
-        Err(e) => format!(r#"{{"error":"Serialisation error: {}"}}"#, e),
-    }
-}
+// Power Query M lives in `m.rs` (token-based; see #11).
+use crate::m::parse_m;
 
 // ---------------------------------------------------------------------------
 // WIT guest impl
@@ -1035,8 +830,232 @@ mod tests {
         assert_eq!(step["position"]["start_line"].as_u64(), Some(1));
         assert_eq!(step["position"]["end_line"].as_u64(), Some(1));
         assert_eq!(step["position"]["start_col"].as_u64(), Some(4));
+        // The step covers its name through its expression (so the
+        // step_expression child lies inside it) and is never zero-length.
         assert_eq!(step["position"]["end_col"].as_u64(),
-                   Some(4 + "UnusedPreview".len() as u64));
+                   Some("    UnusedPreview = Source".len() as u64));
+        let line = source.lines().nth(1).unwrap();
+        assert!(line[4..].starts_with("UnusedPreview"));
+    }
+
+    // ---- #11: complete inline and multi-line Power Query M expressions ----
+
+    fn m_tree(source: &str) -> serde_json::Value {
+        let out = parse_m(source);
+        intentumdiff_plugin_sdk::testing::assert_valid_json(&out, source);
+        intentumdiff_plugin_sdk::testing::assert_no_error(&out, source);
+        serde_json::from_str(&out).unwrap()
+    }
+
+    /// Slice of `source` covered by `node`'s 0-based row / UTF-8 byte span.
+    fn span_text<'s>(source: &'s str, node: &serde_json::Value) -> &'s str {
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let p = &node["position"];
+        let off = |l: &str, c: &str| {
+            starts[p[l].as_u64().unwrap() as usize] + p[c].as_u64().unwrap() as usize
+        };
+        &source[off("start_line", "start_col")..off("end_line", "end_col")]
+    }
+
+    fn find<'v>(node: &'v serde_json::Value, ty: &str, out: &mut Vec<&'v serde_json::Value>) {
+        if node["node_type"] == ty {
+            out.push(node);
+        }
+        for c in node["children"].as_array().into_iter().flatten() {
+            find(c, ty, out);
+        }
+    }
+
+    fn nodes<'v>(tree: &'v serde_json::Value, ty: &str) -> Vec<&'v serde_json::Value> {
+        let mut out = Vec::new();
+        find(tree, ty, &mut out);
+        out
+    }
+
+    fn assert_children_within_parents(source: &str, node: &serde_json::Value) {
+        let key = |n: &serde_json::Value, l: &str, c: &str| {
+            (n["position"][l].as_u64().unwrap(), n["position"][c].as_u64().unwrap())
+        };
+        for c in node["children"].as_array().into_iter().flatten() {
+            assert!(key(c, "start_line", "start_col") >= key(node, "start_line", "start_col")
+                && key(c, "end_line", "end_col") <= key(node, "end_line", "end_col"),
+                "{} outside {} in {:?}", c["id"], node["id"], source);
+            assert_children_within_parents(source, c);
+        }
+    }
+
+    /// Each pair must change a hash and the changed leaf must cover the edit.
+    fn assert_m_pair_changes(old: &str, new: &str, ty: &str, old_label: &str, new_label: &str) {
+        let (o, n) = (m_tree(old), m_tree(new));
+        assert_ne!(o["structural_hash"], n["structural_hash"], "{old:?} -> {new:?}");
+        for (src, tree, label) in [(old, &o, old_label), (new, &n, new_label)] {
+            let hits: Vec<_> = nodes(tree, ty).into_iter()
+                .filter(|x| x["label"] == label).collect();
+            assert_eq!(hits.len(), 1, "{ty} {label:?} in {src:?}: {tree}");
+            assert_eq!(span_text(src, hits[0]).split_whitespace().collect::<Vec<_>>(),
+                       label.split_whitespace().collect::<Vec<_>>());
+            assert_children_within_parents(src, tree);
+        }
+    }
+
+    #[test]
+    fn m_inline_let_value_is_semantic() {
+        assert_m_pair_changes("let x = 1 in x\n", "let x = 2 in x\n", "step_expression", "1", "2");
+        let t = m_tree("let x = 1 in x\n");
+        let q = &t["children"][0];
+        assert_eq!(q["node_type"], "query");
+        assert_eq!(q["children"][0]["label"], "x");
+        assert_eq!(q["children"][1]["node_type"], "query_output");
+        assert_eq!(q["children"][1]["label"], "x");
+        assert_eq!(q["children"][1]["position"]["start_col"], 13);
+        assert_eq!(q["children"][1]["position"]["end_col"], 14);
+        let e = &q["children"][0]["children"][0];
+        assert_eq!((e["position"]["start_col"].as_u64(), e["position"]["end_col"].as_u64()),
+                   (Some(8), Some(9)));
+    }
+
+    #[test]
+    fn m_inline_let_unicode_string_value_is_semantic() {
+        let (old, new) = ("let label = \"λ\" in label\n", "let label = \"μ\" in label\n");
+        assert_m_pair_changes(old, new, "step_expression", "\"λ\"", "\"μ\"");
+        let t = m_tree(old);
+        let e = &t["children"][0]["children"][0]["children"][0];
+        // UTF-8 byte columns: `"λ"` is 4 bytes starting at byte 12.
+        assert_eq!((e["position"]["start_col"].as_u64(), e["position"]["end_col"].as_u64()),
+                   (Some(12), Some(16)));
+    }
+
+    #[test]
+    fn m_multiline_binding_value_is_semantic() {
+        assert_m_pair_changes(
+            "let\n    x =\n        1\nin\n    x\n",
+            "let\n    x =\n        2\nin\n    x\n",
+            "step_expression", "1", "2",
+        );
+        let t = m_tree("let\n    x =\n        1\nin\n    x\n");
+        let step = &t["children"][0]["children"][0];
+        assert_eq!(step["label"], "x");
+        assert_eq!(step["position"]["start_line"], 1);
+        assert_eq!(step["position"]["end_line"], 2);
+        let e = &step["children"][0];
+        assert_eq!(e["position"]["start_line"], 2);
+        assert_eq!(e["position"]["start_col"], 8);
+    }
+
+    #[test]
+    fn m_continuation_binding_is_semantic() {
+        assert_m_pair_changes(
+            "let\n  x = 1 +\n    2\nin x\n",
+            "let\n  x = 1 +\n    3\nin x\n",
+            "step_expression", "1 + 2", "1 + 3",
+        );
+    }
+
+    #[test]
+    fn m_output_continuation_is_semantic() {
+        assert_m_pair_changes(
+            "let\n  x = 1\nin\n  x +\n  2\n",
+            "let\n  x = 1\nin\n  x +\n  3\n",
+            "query_output", "x + 2", "x + 3",
+        );
+    }
+
+    #[test]
+    fn m_several_bindings_per_line_and_nested_structures() {
+        let src = "let a = {1, 2}, b = [p = 1, q = a{0}], c = let z = 3 in z + 1, #\"d e\" = (x) => x, f = \"in, let\" in f\n";
+        let t = m_tree(src);
+        let q = &t["children"][0];
+        let names: Vec<_> = q["children"].as_array().unwrap().iter()
+            .map(|c| c["label"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["a", "b", "c", "d e", "f", "f"]);
+        let exprs: Vec<_> = nodes(&t, "step_expression").iter()
+            .map(|c| c["label"].as_str().unwrap().to_string()).collect();
+        assert_eq!(exprs, ["{1, 2}", "[p = 1, q = a{0}]", "let z = 3 in z + 1", "(x) => x", "\"in, let\""]);
+        for e in nodes(&t, "step_expression") {
+            assert_eq!(span_text(src, e), e["label"].as_str().unwrap());
+        }
+        assert_children_within_parents(src, &t);
+    }
+
+    #[test]
+    fn m_layout_and_comments_do_not_change_hashes() {
+        let base = m_tree("let\n    Source = Table.FromRows({{1, \"a\"}}),\n    Kept = Table.SelectRows(Source, each [Column1] > 0)\nin\n    Kept\n");
+        for variant in [
+            "// leading comment\nlet\n    Source = Table.FromRows({{1, \"a\"}}),\n    Kept = Table.SelectRows(Source, each [Column1] > 0)\nin\n    Kept\n",
+            "let Source = Table.FromRows({{1, \"a\"}}), Kept = Table.SelectRows(Source, each [Column1] > 0) in Kept\n",
+            "let\n  Source =\n    Table.FromRows({{1, \"a\"}}), /* block */\n  Kept = Table.SelectRows(Source,\n      each [Column1] > 0) // trailing\nin\n  Kept",
+        ] {
+            assert_eq!(base["structural_hash"], m_tree(variant)["structural_hash"], "{variant:?}");
+        }
+        // Text inside string literals is content, not a comment or layout.
+        let a = m_tree("let x = \"a // b\" in x\n");
+        let b = m_tree("let x = \"a // c\" in x\n");
+        assert_ne!(a["structural_hash"], b["structural_hash"]);
+        let a = m_tree("let x = \"a  b\" in x\n");
+        let b = m_tree("let x = \"a b\" in x\n");
+        assert_ne!(a["structural_hash"], b["structural_hash"]);
+    }
+
+    #[test]
+    fn m_identity_is_deterministic() {
+        let src = "let\n    x =\n        1\nin\n    x\n";
+        assert_eq!(parse_m(src), parse_m(src));
+    }
+
+    #[test]
+    fn m_non_let_and_section_documents_keep_their_content() {
+        assert_m_pair_changes("1 + 2\n", "1 + 3\n", "expression", "1 + 2", "1 + 3");
+        let old = "section Sales;\nshared Total = let s = 1 in s;\nHelper = 5;\n";
+        let new = "section Sales;\nshared Total = let s = 2 in s;\nHelper = 5;\n";
+        assert_m_pair_changes(old, new, "step_expression", "1", "2");
+        let t = m_tree(old);
+        let sec = &t["children"][0];
+        assert_eq!(sec["node_type"], "section");
+        assert_eq!(sec["label"], "Sales");
+        let members = sec["children"].as_array().unwrap();
+        assert_eq!(members[0]["label"], "Total");
+        assert_eq!(members[0]["children"][0]["node_type"], "modifier");
+        assert_eq!(members[1]["label"], "Helper");
+        assert_eq!(members[1]["children"][0]["node_type"], "member_expression");
+        let unshared = m_tree("section Sales;\nTotal = let s = 1 in s;\nHelper = 5;\n");
+        assert_ne!(t["structural_hash"], unshared["structural_hash"]);
+    }
+
+    #[test]
+    fn m_incomplete_and_odd_inputs_never_panic() {
+        for src in [
+            "", "let", "let x", "let x =", "let x = (1, [2", "let x = \"unterminated",
+            "let #\"open", "/* open comment", "in x", "let x = 1 in", "section", "section S; x",
+            "let\n    Source = Sql.Database(\"server\", \"sales\"),\n    FilteredRows = Table.SelectRows(Source, each [Amount] > 10",
+            "let é = \"ü\" in é", "let x = 1..5 in x", "let x = 0xFF + 1.5e3 in x\r\n",
+        ] {
+            let t = m_tree(src);
+            assert_children_within_parents(src, &t);
+            let _ = span_text(src, &t);
+        }
+    }
+
+    #[test]
+    fn m_detects_inline_let_and_section_files() {
+        assert_eq!(detect_language_impl("q.m", "let x = 1 in x\n"), "m");
+        assert_eq!(detect_language_impl("q.m", "// c\nlet\n x = 1\nin x"), "m");
+        assert_eq!(detect_language_impl("q.m", "section S;\nx = 1;"), "m");
+        assert_eq!(detect_language_impl("q.m", "letter = 1"), "");
+    }
+
+    #[test]
+    fn dax_multiline_definitions_contain_their_expressions() {
+        let src = "DEFINE\nMEASURE Sales[Sales YTD] =\n    TOTALYTD(SUM(Sales[Amount]),\n\n    // note\n        Dates[Date])\nEVALUATE ROW(\"label\", \"λ\")\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_dax(src)).unwrap();
+        assert_children_within_parents(src, &tree);
+        let m = &tree["children"][0];
+        let e = &m["children"][0];
+        assert_eq!(e["position"]["end_line"], 5);
+        assert!(span_text(src, e).ends_with("Dates[Date])"));
+        let q = &tree["children"][1]["children"][0];
+        assert_eq!(span_text(src, q), "ROW(\"label\", \"λ\")");
     }
 
 }
