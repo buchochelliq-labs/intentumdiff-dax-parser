@@ -308,18 +308,55 @@ impl<'a> MParser<'a> {
     }
 
     /// End of a top-level expression starting at `a`: the next depth-0 `let`
-    /// that begins a line (a following query), or `end`.
+    /// that begins a line (a following query), or `end`. A `let` is only a
+    /// document boundary where the expression so far is complete: not inside
+    /// an `if` still waiting for its `else`, a nested `let` still waiting for
+    /// its `in`, or right after a token that needs an operand (`then`, `in`,
+    /// `each`, an operator, ...) — there it is a nested expression (#13).
     fn top_expression_end(&self, a: usize, end: usize) -> usize {
         let mut depth = 0i32;
+        let mut open_ifs = 0usize;
+        let mut open_lets = 0usize;
         let mut k = a;
         while k < end {
-            if k > a && depth == 0 && self.is_word(k, "let") && self.first_on_line(k) {
-                return k;
+            if depth == 0 {
+                if k > a
+                    && self.is_word(k, "let")
+                    && self.first_on_line(k)
+                    && open_ifs == 0
+                    && open_lets == 0
+                    && !self.expects_operand(k - 1)
+                {
+                    return k;
+                }
+                if self.is_word(k, "if") {
+                    open_ifs += 1;
+                } else if self.is_word(k, "else") {
+                    open_ifs = open_ifs.saturating_sub(1);
+                } else if self.is_word(k, "let") {
+                    open_lets += 1;
+                } else if self.is_word(k, "in") {
+                    open_lets = open_lets.saturating_sub(1);
+                }
             }
             depth = (depth + self.bracket_delta(k)).max(0);
             k += 1;
         }
         end
+    }
+
+    /// Does token `i` leave an expression incomplete (an operand must follow)?
+    fn expects_operand(&self, i: usize) -> bool {
+        match self.toks[i].kind {
+            Kind::Op => true,
+            Kind::Punct => matches!(self.text(i), "(" | "[" | "{" | ","),
+            Kind::Ident => matches!(
+                self.text(i),
+                "if" | "then" | "else" | "in" | "each" | "and" | "or" | "not" | "try"
+                    | "otherwise" | "as" | "is" | "meta" | "type" | "error" | "let"
+            ),
+            _ => false,
+        }
     }
 
     fn quoted_name(&self, i: usize) -> String {

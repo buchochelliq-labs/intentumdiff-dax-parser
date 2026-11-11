@@ -1058,4 +1058,36 @@ mod tests {
         assert_eq!(span_text(src, q), "ROW(\"label\", \"λ\")");
     }
 
+    // ---- #13: a nested `let` that starts a line is not a new document ----
+
+    #[test]
+    fn m_nested_let_on_new_line_stays_in_enclosing_output() {
+        let old = "let x = 1 in if true then let y = 2 in y else 0";
+        let base = m_tree(old);
+        let queries = base["children"].as_array().unwrap();
+        assert_eq!(queries.len(), 1, "{base}");
+        let output = &nodes(&base, "query_output")[0];
+        assert_eq!(output["label"], "if true then let y = 2 in y else 0");
+        for variant in [
+            "let x = 1 in if true then\nlet y = 2 in y else 0",
+            "let x = 1 in if true then 1 else\nlet y = 2 in y",
+            "let x = 1 in\nlet y = 2 in y",
+            "let x = 1 in x +\nlet y = 2 in y",
+            "let x = 1 in f(\nlet y = 2 in y)",
+            "let x = 1 in each\nlet y = 2 in y",
+        ] {
+            let t = m_tree(variant);
+            assert_eq!(t["children"].as_array().unwrap().len(), 1, "{variant:?}: {t}");
+            assert_children_within_parents(variant, &t);
+        }
+        let reflowed = m_tree("let x = 1 in if true then\nlet y = 2 in y else 0");
+        assert_eq!(nodes(&reflowed, "query_output")[0]["label"], output["label"]);
+        assert_eq!(reflowed["structural_hash"], base["structural_hash"]);
+        // Two genuinely separate top-level documents are still split.
+        for two in ["let a = 1 in a\nlet b = 2 in b\n", "let a = 1 in if a then 1 else 0\nlet b = 2 in b\n",
+                    "let a = 1 in f(a)\nlet b = 2 in b\n", "let a = 1 in let c = 3 in c\nlet b = 2 in b\n"] {
+            let t = m_tree(two);
+            assert_eq!(t["children"].as_array().unwrap().len(), 2, "{two:?}: {t}");
+        }
+    }
 }
